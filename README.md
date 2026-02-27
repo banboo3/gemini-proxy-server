@@ -24,15 +24,7 @@ After the WebSocket handshake completes, the server connects to the target via T
 
 ## Deploy to Railway
 
-### 1. Push to GitHub
-
-```bash
-cd gemini-proxy-server
-git init
-git add .
-git commit -m "feat: initial proxy server"
-gh repo create gemini-proxy-server --public --push
-```
+### 1. Fork to Your GitHub
 
 ### 2. Create Railway project
 
