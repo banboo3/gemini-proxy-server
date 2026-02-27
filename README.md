@@ -1,22 +1,26 @@
 # Gemini Proxy Server
 
-A lightweight HTTP/HTTPS proxy server written in Rust, designed to be deployed on [Railway](https://railway.app). Acts as a relay between the Gemini Next Desktop client and Google, with token-based authentication.
+A lightweight WebSocket tunnel server written in Rust, designed to be deployed on [Railway](https://railway.app). Relays TCP traffic between the Gemini Next Desktop client and Google via WebSocket binary frames, with token-based authentication.
 
 ## How It Works
 
 ```
 Gemini Next Desktop (Windows)
-  ↓ CONNECT tunnel (with Proxy-Authorization token)
-Railway Proxy Server
-  ↓
+  ↓ WebSocket upgrade: GET /tunnel?target=gemini.google.com:443
+  ↓ Authorization: Bearer TOKEN
+Railway Proxy Server (101 Switching Protocols)
+  ↓ TCP connect to target
 gemini.google.com
 ```
 
-The server handles:
-- `CONNECT` tunnels for HTTPS traffic (covers WebSocket and SSE streaming too)
-- Plain HTTP forwarding
-- Token authentication via `Proxy-Authorization: Basic user:TOKEN`
-- Automatic stripping of `X-Forwarded-For` and `Via` headers
+The server exposes two routes:
+
+| Route | Method | Auth | Purpose |
+|-------|--------|------|---------|
+| `/health` | GET | No | Health check / wake-up ping |
+| `/tunnel?target=host:port` | GET | Bearer token | WebSocket upgrade → TCP tunnel |
+
+After the WebSocket handshake completes, the server connects to the target via TCP and relays data bidirectionally: WebSocket binary frames ↔ raw TCP bytes.
 
 ## Deploy to Railway
 
@@ -59,8 +63,10 @@ After deployment, Railway assigns a domain like `your-app.railway.app`. Note thi
 
 In Gemini Next Desktop settings, set the Proxy Server field to:
 ```
-http://user:YOUR_TOKEN@your-app.railway.app:8080
+http://user:YOUR_TOKEN@your-app.up.railway.app
 ```
+
+The client connects to Railway over TLS on port 443 and upgrades to WebSocket at `/tunnel?target=gemini.google.com:443`.
 
 ## Environment Variables
 
@@ -79,12 +85,17 @@ PROXY_TOKEN=mytoken PORT=8080 ./target/release/gemini-proxy-server
 
 Test with curl:
 ```bash
-curl -x http://user:mytoken@localhost:8080 https://httpbin.org/ip
+# Health check
+curl https://your-app.up.railway.app/health
+
+# WebSocket tunnel (via websocat for testing)
+websocat -H "Authorization: Bearer mytoken" \
+  wss://your-app.up.railway.app/tunnel?target=httpbin.org:443
 ```
 
 ## Security Notes
 
 - Always set `PROXY_TOKEN` — without it anyone can use your proxy
 - Use a high-entropy token (32+ random hex characters)
-- Railway enforces HTTPS on its public domain, so the token is encrypted in transit
-- The server strips `X-Forwarded-For` and `Via` headers so Google cannot detect the proxy hop
+- Railway enforces HTTPS on its public domain, so the Bearer token is encrypted in transit
+- The WebSocket tunnel carries raw TCP bytes — Railway's HTTP reverse proxy sees only the initial upgrade request

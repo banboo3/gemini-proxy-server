@@ -1,7 +1,10 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use http_body_util::{combinators::BoxBody, BodyExt, Empty};
+use sha1::{Digest, Sha1};
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::{Bytes, Incoming},
+    header,
     server::conn::http1,
     service::service_fn,
     Method, Request, Response, StatusCode,
@@ -9,6 +12,7 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::{tungstenite::protocol::Message, WebSocketStream};
 use tracing::{error, info, warn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -53,7 +57,6 @@ async fn main() {
                 .with_upgrades()
                 .await
             {
-                // Ignore connection reset / broken pipe
                 let msg = e.to_string();
                 if !msg.contains("connection reset")
                     && !msg.contains("broken pipe")
@@ -71,144 +74,201 @@ async fn handle(
     token: String,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
-    // Auth check
-    if !token.is_empty() && !is_authorized(&req, &token) {
-        warn!("Unauthorized request from {peer}");
-        let mut resp = Response::new(empty());
-        *resp.status_mut() = StatusCode::PROXY_AUTHENTICATION_REQUIRED;
-        resp.headers_mut().insert(
-            "Proxy-Authenticate",
-            "Basic realm=\"GeminiProxy\"".parse().unwrap(),
-        );
-        return Ok(resp);
+    let path = req.uri().path().to_string();
+
+    // Health check — no auth required
+    if path == "/health" && req.method() == Method::GET {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(full_body("ok"))
+            .unwrap());
     }
 
-    if req.method() == Method::CONNECT {
-        handle_connect(req, peer).await
-    } else {
-        handle_http(req, peer).await
+    // WebSocket tunnel — auth required
+    if path == "/tunnel" && req.method() == Method::GET {
+        if !token.is_empty() && !is_authorized(&req, &token) {
+            warn!("Unauthorized tunnel request from {peer}");
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(full_body("unauthorized"))
+                .unwrap());
+        }
+        return handle_tunnel(req, peer).await;
     }
+
+    // Everything else → 404
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(full_body("not found"))
+        .unwrap())
 }
 
-/// HTTPS tunnel via CONNECT
-async fn handle_connect(
+/// Handle WebSocket upgrade at /tunnel?target=host:port
+async fn handle_tunnel(
     req: Request<Incoming>,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
-    let host = req
+    // Extract target from query string
+    let target = req
         .uri()
-        .authority()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|p| p.strip_prefix("target="))
+        })
+        .unwrap_or("")
+        .to_string();
 
-    info!("CONNECT {host} from {peer}");
+    if target.is_empty() {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(full_body("missing target query param"))
+            .unwrap());
+    }
 
-    tokio::task::spawn(async move {
-        match hyper::upgrade::on(req).await {
+    info!("Tunnel request for {target} from {peer}");
+
+    // Perform the WebSocket upgrade using hyper's upgrade mechanism
+    let (response, fut) = hyper_ws_upgrade(req)?;
+
+    tokio::spawn(async move {
+        match fut.await {
             Ok(upgraded) => {
-                if let Err(e) = tunnel(upgraded, &host).await {
+                if let Err(e) = ws_tunnel(upgraded, &target).await {
                     let msg = e.to_string();
                     if !msg.contains("connection reset") && !msg.contains("broken pipe") {
-                        error!("Tunnel error for {host}: {e}");
+                        error!("Tunnel error for {target}: {e}");
                     }
                 }
             }
-            Err(e) => error!("Upgrade error for {host}: {e}"),
+            Err(e) => error!("Upgrade error for {target}: {e}"),
         }
     });
 
-    Ok(Response::new(empty()))
+    Ok(response)
 }
 
-/// Bidirectional TCP tunnel between upgraded connection and target
-async fn tunnel(
-    upgraded: hyper::upgrade::Upgraded,
-    host: &str,
-) -> Result<(), BoxError> {
-    let mut server = TcpStream::connect(host).await?;
-    let mut client = TokioIo::new(upgraded);
+/// Build a 101 Switching Protocols response and return a future for the upgraded connection.
+/// Takes ownership of the request because `hyper::upgrade::on` requires it.
+fn hyper_ws_upgrade(
+    req: Request<Incoming>,
+) -> Result<(
+    Response<BoxBody<Bytes, BoxError>>,
+    impl std::future::Future<Output = Result<hyper::upgrade::Upgraded, hyper::Error>>,
+), BoxError> {
+    // Validate WebSocket upgrade headers
+    let key = req
+        .headers()
+        .get("Sec-WebSocket-Key")
+        .ok_or("missing Sec-WebSocket-Key")?
+        .to_str()?
+        .to_string();
 
-    // Return 200 Connection Established before tunneling
-    // (hyper sends this automatically when we return 200 from handle_connect)
-    tokio::io::copy_bidirectional(&mut client, &mut server).await?;
+    // Compute accept key per RFC 6455
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-5AB5FB80F65B");
+    let accept = STANDARD.encode(hasher.finalize());
+
+    let upgrade_fut = hyper::upgrade::on(req);
+
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header("Sec-WebSocket-Accept", accept)
+        .body(empty())
+        .unwrap();
+
+    Ok((response, upgrade_fut))
+}
+
+/// Bidirectional relay: WebSocket binary frames ↔ TCP bytes
+async fn ws_tunnel(
+    upgraded: hyper::upgrade::Upgraded,
+    target: &str,
+) -> Result<(), BoxError> {
+    // Connect to the actual target (e.g. gemini.google.com:443)
+    let tcp = TcpStream::connect(target).await?;
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp);
+
+    // Wrap the upgraded connection as a WebSocket server stream
+    let ws = WebSocketStream::from_raw_socket(
+        TokioIo::new(upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    info!("Tunnel established to {target}");
+
+    // WS → TCP: read binary frames from client, write to target
+    let ws_to_tcp = async {
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if tokio::io::AsyncWriteExt::write_all(&mut tcp_write, &data).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {} // ignore ping/pong/text
+            }
+        }
+    };
+
+    // TCP → WS: read bytes from target, send as binary frames
+    let tcp_to_ws = async {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let n = match tokio::io::AsyncReadExt::read(&mut tcp_read, &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if ws_sink.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ws_to_tcp => {}
+        _ = tcp_to_ws => {}
+    }
+
     Ok(())
 }
 
-/// Plain HTTP forwarding
-async fn handle_http(
-    mut req: Request<Incoming>,
-    peer: SocketAddr,
-) -> Result<Response<BoxBody<Bytes, BoxError>>, BoxError> {
-    let uri = req.uri().clone();
-    let host = uri
-        .host()
-        .ok_or("Missing host in HTTP request")?
-        .to_string();
-    let port = uri.port_u16().unwrap_or(80);
-    let addr = format!("{host}:{port}");
-
-    info!("HTTP {} {uri} from {peer}", req.method());
-
-    // Strip hop-by-hop and proxy headers before forwarding
-    strip_hop_headers(req.headers_mut());
-    req.headers_mut().remove("proxy-authorization");
-
-    let stream = TcpStream::connect(&addr).await?;
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) =
-        hyper::client::conn::http1::Builder::new()
-            .preserve_header_case(true)
-            .title_case_headers(true)
-            .handshake(io)
-            .await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            error!("HTTP client conn error: {e}");
-        }
-    });
-
-    let resp = sender.send_request(req).await?;
-    Ok(resp.map(|b| b.map_err(|e| Box::new(e) as BoxError).boxed()))
-}
-
-/// Check Proxy-Authorization header against our token
+/// Check Authorization header against our token
 fn is_authorized(req: &Request<Incoming>, token: &str) -> bool {
-    let Some(auth) = req.headers().get("proxy-authorization") else {
+    let Some(auth) = req.headers().get(header::AUTHORIZATION) else {
         return false;
     };
     let Ok(val) = auth.to_str() else { return false };
 
-    // Support both "Basic base64(user:token)" and bare "Bearer token"
+    if let Some(bearer) = val.strip_prefix("Bearer ") {
+        return bearer == token;
+    }
     if let Some(encoded) = val.strip_prefix("Basic ") {
         if let Ok(decoded) = STANDARD.decode(encoded) {
             if let Ok(s) = std::str::from_utf8(&decoded) {
-                // user:token — we only check the password part
                 let pass = s.splitn(2, ':').nth(1).unwrap_or(s);
                 return pass == token;
             }
         }
     }
-    if let Some(bearer) = val.strip_prefix("Bearer ") {
-        return bearer == token;
-    }
     false
-}
-
-/// Remove hop-by-hop headers that must not be forwarded
-fn strip_hop_headers(headers: &mut hyper::HeaderMap) {
-    for key in &[
-        "connection", "keep-alive", "proxy-authenticate",
-        "proxy-authorization", "te", "trailers",
-        "transfer-encoding", "upgrade",
-    ] {
-        headers.remove(*key);
-    }
 }
 
 fn empty() -> BoxBody<Bytes, BoxError> {
     Empty::<Bytes>::new()
+        .map_err(|e| Box::new(e) as BoxError)
+        .boxed()
+}
+
+fn full_body(s: &str) -> BoxBody<Bytes, BoxError> {
+    Full::new(Bytes::from(s.to_string()))
         .map_err(|e| Box::new(e) as BoxError)
         .boxed()
 }
