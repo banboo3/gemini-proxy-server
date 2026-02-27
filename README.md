@@ -61,7 +61,7 @@ After deployment, Railway assigns a domain like `your-app.railway.app`. Note thi
 
 ### 5. Configure the client
 
-In Gemini Next Desktop settings, set the Proxy Server field to:
+In Gemini Next Windows settings, set the Proxy Server field to,and **the "user" can be set any character**:
 ```
 http://user:YOUR_TOKEN@your-app.up.railway.app
 ```
